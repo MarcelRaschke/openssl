@@ -33,8 +33,10 @@ jobs:
           no-srp,
           no-srtp,
           no-ts,
+          no-integrity-only-ciphers,
           enable-weak-ssl-ciphers,
           enable-zlib,
+          enable-pie,
         ]
     runs-on: ubuntu-latest
     steps:

@@ -132,7 +132,7 @@ static inline void *apple_atomic_load_n_pvoid(void **p,
 static pthread_mutex_t atomic_sim_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #  define IMPL_fallback_atomic_load_n(t)                        \
-    static inline t fallback_atomic_load_n_##t(t *p)            \
+    static ossl_inline t fallback_atomic_load_n_##t(t *p)            \
     {                                                           \
         t ret;                                                  \
                                                                 \
@@ -147,7 +147,7 @@ IMPL_fallback_atomic_load_n(pvoid)
 #  define ATOMIC_LOAD_N(t, p, o) fallback_atomic_load_n_##t(p)
 
 #  define IMPL_fallback_atomic_store_n(t)                       \
-    static inline t fallback_atomic_store_n_##t(t *p, t v)      \
+    static ossl_inline t fallback_atomic_store_n_##t(t *p, t v)      \
     {                                                           \
         t ret;                                                  \
                                                                 \
@@ -162,7 +162,7 @@ IMPL_fallback_atomic_store_n(uint64_t)
 #  define ATOMIC_STORE_N(t, p, v, o) fallback_atomic_store_n_##t(p, v)
 
 #  define IMPL_fallback_atomic_store(t)                         \
-    static inline void fallback_atomic_store_##t(t *p, t *v)    \
+    static ossl_inline void fallback_atomic_store_##t(t *p, t *v)    \
     {                                                           \
         pthread_mutex_lock(&atomic_sim_lock);                   \
         *p = *v;                                                \
@@ -174,7 +174,7 @@ IMPL_fallback_atomic_store(pvoid)
 #  define ATOMIC_STORE(t, p, v, o) fallback_atomic_store_##t(p, v)
 
 #  define IMPL_fallback_atomic_exchange_n(t)                            \
-    static inline t fallback_atomic_exchange_n_##t(t *p, t v)           \
+    static ossl_inline t fallback_atomic_exchange_n_##t(t *p, t v)           \
     {                                                                   \
         t ret;                                                          \
                                                                         \
@@ -196,7 +196,7 @@ IMPL_fallback_atomic_exchange_n(prcu_cb_item)
  * way as the fallbacks above.
  */
 
-static inline uint64_t fallback_atomic_add_fetch(uint64_t *p, uint64_t v)
+static ossl_inline uint64_t fallback_atomic_add_fetch(uint64_t *p, uint64_t v)
 {
     uint64_t ret;
 
@@ -209,7 +209,7 @@ static inline uint64_t fallback_atomic_add_fetch(uint64_t *p, uint64_t v)
 
 #  define ATOMIC_ADD_FETCH(p, v, o) fallback_atomic_add_fetch(p, v)
 
-static inline uint64_t fallback_atomic_fetch_add(uint64_t *p, uint64_t v)
+static ossl_inline uint64_t fallback_atomic_fetch_add(uint64_t *p, uint64_t v)
 {
     uint64_t ret;
 
@@ -222,7 +222,7 @@ static inline uint64_t fallback_atomic_fetch_add(uint64_t *p, uint64_t v)
 
 #  define ATOMIC_FETCH_ADD(p, v, o) fallback_atomic_fetch_add(p, v)
 
-static inline uint64_t fallback_atomic_sub_fetch(uint64_t *p, uint64_t v)
+static ossl_inline uint64_t fallback_atomic_sub_fetch(uint64_t *p, uint64_t v)
 {
     uint64_t ret;
 
@@ -235,7 +235,7 @@ static inline uint64_t fallback_atomic_sub_fetch(uint64_t *p, uint64_t v)
 
 #  define ATOMIC_SUB_FETCH(p, v, o) fallback_atomic_sub_fetch(p, v)
 
-static inline uint64_t fallback_atomic_and_fetch(uint64_t *p, uint64_t m)
+static ossl_inline uint64_t fallback_atomic_and_fetch(uint64_t *p, uint64_t m)
 {
     uint64_t ret;
 
@@ -248,7 +248,7 @@ static inline uint64_t fallback_atomic_and_fetch(uint64_t *p, uint64_t m)
 
 #  define ATOMIC_AND_FETCH(p, v, o) fallback_atomic_and_fetch(p, v)
 
-static inline uint64_t fallback_atomic_or_fetch(uint64_t *p, uint64_t m)
+static ossl_inline uint64_t fallback_atomic_or_fetch(uint64_t *p, uint64_t m)
 {
     uint64_t ret;
 
@@ -409,7 +409,9 @@ static void ossl_rcu_free_local_data(void *arg)
     OSSL_LIB_CTX *ctx = arg;
     CRYPTO_THREAD_LOCAL *lkey = ossl_lib_ctx_get_rcukey(ctx);
     struct rcu_thr_data *data = CRYPTO_THREAD_get_local(lkey);
+
     OPENSSL_free(data);
+    CRYPTO_THREAD_set_local(lkey, NULL);
 }
 
 void ossl_rcu_read_lock(CRYPTO_RCU_LOCK *lock)
@@ -862,6 +864,58 @@ int CRYPTO_atomic_add(int *val, int amount, int *ret, CRYPTO_RWLOCK *lock)
         return 0;
 
     *val += amount;
+    *ret  = *val;
+
+    if (!CRYPTO_THREAD_unlock(lock))
+        return 0;
+
+    return 1;
+}
+
+int CRYPTO_atomic_add64(uint64_t *val, uint64_t op, uint64_t *ret,
+                        CRYPTO_RWLOCK *lock)
+{
+# if defined(__GNUC__) && defined(__ATOMIC_ACQ_REL) && !defined(BROKEN_CLANG_ATOMICS)
+    if (__atomic_is_lock_free(sizeof(*val), val)) {
+        *ret = __atomic_add_fetch(val, op, __ATOMIC_ACQ_REL);
+        return 1;
+    }
+# elif defined(__sun) && (defined(__SunOS_5_10) || defined(__SunOS_5_11))
+    /* This will work for all future Solaris versions. */
+    if (ret != NULL) {
+        *ret = atomic_add_64_nv(val, op);
+        return 1;
+    }
+# endif
+    if (lock == NULL || !CRYPTO_THREAD_write_lock(lock))
+        return 0;
+    *val += op;
+    *ret  = *val;
+
+    if (!CRYPTO_THREAD_unlock(lock))
+        return 0;
+
+    return 1;
+}
+
+int CRYPTO_atomic_and(uint64_t *val, uint64_t op, uint64_t *ret,
+                      CRYPTO_RWLOCK *lock)
+{
+# if defined(__GNUC__) && defined(__ATOMIC_ACQ_REL) && !defined(BROKEN_CLANG_ATOMICS)
+    if (__atomic_is_lock_free(sizeof(*val), val)) {
+        *ret = __atomic_and_fetch(val, op, __ATOMIC_ACQ_REL);
+        return 1;
+    }
+# elif defined(__sun) && (defined(__SunOS_5_10) || defined(__SunOS_5_11))
+    /* This will work for all future Solaris versions. */
+    if (ret != NULL) {
+        *ret = atomic_and_64_nv(val, op);
+        return 1;
+    }
+# endif
+    if (lock == NULL || !CRYPTO_THREAD_write_lock(lock))
+        return 0;
+    *val &= op;
     *ret  = *val;
 
     if (!CRYPTO_THREAD_unlock(lock))
